@@ -50,21 +50,30 @@ import (
 // concurrent builds on giant machines, and uses only 1 core on tiny machines.
 var pgzipThreads = min(runtime.GOMAXPROCS(0), 8)
 
+// pgzipBlockSize (1 MiB) equals pgzip's default block size, so capping only
+// changes the worker count, never the block geometry.
+const pgzipBlockSize = 1 << 20
+
+func capPgzipConcurrency(zw *gzip.Writer) *gzip.Writer {
+	if err := zw.SetConcurrency(pgzipBlockSize, pgzipThreads); err != nil {
+		// This should never happen.
+		panic(fmt.Errorf("tried to set pgzip concurrency to %d: %w", pgzipThreads, err))
+	}
+	return zw
+}
+
 var pgzipPool = sync.Pool{
 	New: func() any {
-		zw := gzip.NewWriter(nil)
-		if err := zw.SetConcurrency(1<<20, pgzipThreads); err != nil {
-			// This should never happen.
-			panic(fmt.Errorf("tried to set pgzip concurrency to %d: %w", pgzipThreads, err))
-		}
-		return zw
+		return capPgzipConcurrency(gzip.NewWriter(nil))
 	},
 }
 
 func pooledGzipWriter(w io.Writer) *gzip.Writer {
 	zw := pgzipPool.Get().(*gzip.Writer)
 	zw.Reset(w)
-	return zw
+	// Reset reverts the writer to pgzip's default concurrency of
+	// GOMAXPROCS(0) blocks, so the cap has to be reapplied on every reuse.
+	return capPgzipConcurrency(zw)
 }
 
 var bufioPool = sync.Pool{
