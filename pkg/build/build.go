@@ -33,6 +33,7 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	v1types "github.com/google/go-containerregistry/pkg/v1/types"
+	gzip "github.com/klauspost/pgzip"
 	"go.opentelemetry.io/otel"
 	"gopkg.in/yaml.v3"
 
@@ -216,9 +217,18 @@ func (bc *Context) ImageLayoutToLayer(ctx context.Context) (string, v1.Layer, er
 	}
 
 	defer outfile.Close()
-	lw := newLayerWriter(outfile)
+	var lw *layerWriter
+	if bc.o.CompressedLayerFile {
+		lw, err = newCompressedLayerWriter(outfile, pgzipThreads)
+		if err != nil {
+			return "", nil, err
+		}
+	} else {
+		lw = newLayerWriter(outfile)
+	}
 
 	if err := writeTar(ctx, lw.w, bc.fs); err != nil {
+		lw.Abort()
 		return "", nil, fmt.Errorf("generating tarball: %w", err)
 	}
 
@@ -413,6 +423,7 @@ type layer struct {
 	compressed   string
 	diffid       *v1.Hash
 	desc         *v1.Descriptor
+	sealed       bool // desc complete at construction and immutable, readable without mu
 }
 
 func (l *layer) compress() error {
@@ -480,6 +491,11 @@ func (l *layer) DiffID() (v1.Hash, error) {
 }
 
 func (l *layer) Digest() (v1.Hash, error) {
+	// A sealed layer computed its descriptor during the write.
+	if l.sealed {
+		return l.desc.Digest, nil
+	}
+
 	// Check if we've already compressed a layer with this diffID
 	if cached, ok := compressionCache.Load(l.diffid.String()); ok {
 		cachedDesc := cached.(*v1.Descriptor)
@@ -509,10 +525,45 @@ func (l *layer) Compressed() (io.ReadCloser, error) {
 }
 
 func (l *layer) Uncompressed() (io.ReadCloser, error) {
+	if l.uncompressed == "" {
+		f, err := os.Open(l.compressed)
+		if err != nil {
+			return nil, err
+		}
+		zr, err := gzip.NewReader(f)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return &gunzipReadCloser{zr: zr, f: f}, nil
+	}
 	return os.Open(l.uncompressed)
 }
 
+// gunzipReadCloser decompresses a compressed-backed layer on demand. Close
+// has to release both the gzip reader and the underlying file, because
+// gzip.Reader.Close does not close its source.
+type gunzipReadCloser struct {
+	zr *gzip.Reader
+	f  *os.File
+}
+
+func (g *gunzipReadCloser) Read(p []byte) (int, error) { return g.zr.Read(p) }
+
+func (g *gunzipReadCloser) Close() error {
+	zerr := g.zr.Close()
+	if ferr := g.f.Close(); zerr == nil {
+		return ferr
+	}
+	return zerr
+}
+
 func (l *layer) Size() (int64, error) {
+	// A sealed layer computed its descriptor during the write.
+	if l.sealed {
+		return l.desc.Size, nil
+	}
+
 	// Check if we've already compressed a layer with this diffID
 	if cached, ok := compressionCache.Load(l.diffid.String()); ok {
 		cachedDesc := cached.(*v1.Descriptor)

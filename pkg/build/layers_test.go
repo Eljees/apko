@@ -17,11 +17,15 @@ package build
 import (
 	"archive/tar"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"runtime"
 	"slices"
 	"testing"
+	"time"
 
 	"chainguard.dev/apko/pkg/apk/apk"
 	apkfs "chainguard.dev/apko/pkg/apk/fs"
@@ -231,6 +235,14 @@ func compareStacks(a, b []*file) error {
 }
 
 func TestSplitLayersDirectoryCreation(t *testing.T) {
+	for _, compressed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("compressed=%v", compressed), func(t *testing.T) {
+			testSplitLayersDirectoryCreation(t, compressed)
+		})
+	}
+}
+
+func testSplitLayersDirectoryCreation(t *testing.T, compressed bool) {
 	// Create a minimal filesystem with an installed DB file
 	fsys := apkfs.NewMemFS()
 
@@ -280,7 +292,7 @@ func TestSplitLayersDirectoryCreation(t *testing.T) {
 
 	// Call splitLayers to create the layers
 	ctx := context.Background()
-	layers, err := splitLayers(ctx, fsys, groups, pkgToDiff, tmpDir)
+	layers, err := splitLayers(ctx, fsys, groups, pkgToDiff, tmpDir, compressed)
 	if err != nil {
 		t.Fatalf("splitLayers failed: %v", err)
 	}
@@ -346,5 +358,72 @@ func TestSplitLayersDirectoryCreation(t *testing.T) {
 				t.Errorf("layer %d missing parent directory %q - this indicates the directory creation fix is not working", i, dir)
 			}
 		}
+	}
+}
+
+// failOpenFS delegates to the wrapped FS but fails Open for one path,
+// driving splitLayers into its failure cleanup mid-walk.
+type failOpenFS struct {
+	apkfs.FullFS
+	failPath string
+}
+
+func (f *failOpenFS) Open(name string) (fs.File, error) {
+	if name == f.failPath {
+		return nil, errors.New("injected open failure")
+	}
+	return f.FullFS.Open(name)
+}
+
+func TestSplitLayersFailureCleanup(t *testing.T) {
+	for _, compressed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("compressed=%v", compressed), func(t *testing.T) {
+			before := runtime.NumGoroutine()
+
+			fsys := apkfs.NewMemFS()
+			if err := fsys.MkdirAll("usr/lib/apk/db", 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := fsys.WriteFile("usr/lib/apk/db/installed", []byte("test db content"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			// Sorts after the installed db, so layer content has been written
+			// through the writers before the failure hits.
+			if err := fsys.WriteFile("usr/zfail", []byte("doomed content"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			pkg1 := &apk.Package{Name: "pkg1", Origin: "pkg1", Version: "1.0.0", InstalledSize: 1000}
+			groups := []*group{{pkgs: []*apk.Package{pkg1}, size: 1000, tiebreaker: "pkg1"}}
+			pkgToDiff := map[*apk.Package][]byte{pkg1: []byte("pkg1 info\n")}
+
+			tmpDir := t.TempDir()
+			layers, err := splitLayers(t.Context(), &failOpenFS{FullFS: fsys, failPath: "usr/zfail"}, groups, pkgToDiff, tmpDir, compressed)
+			if err == nil {
+				t.Fatalf("splitLayers: got %d layers, want injected error", len(layers))
+			}
+
+			entries, err := os.ReadDir(tmpDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				names := make([]string, 0, len(entries))
+				for _, e := range entries {
+					names = append(names, e.Name())
+				}
+				t.Errorf("partial layer files left behind: %v", names)
+			}
+
+			// The writers' compression pipelines must be fully reaped; a
+			// lingering goroutine here is the pgzip output-listener leak.
+			deadline := time.Now().Add(2 * time.Second)
+			for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if got := runtime.NumGoroutine(); got > before {
+				t.Errorf("goroutines: got = %d, want <= %d (compression goroutines still running)", got, before)
+			}
+		})
 	}
 }
